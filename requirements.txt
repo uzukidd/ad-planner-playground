@@ -1,0 +1,2 @@
+highway-env==1.12.1
+matplotlib==3.11.1

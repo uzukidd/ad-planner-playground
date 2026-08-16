@@ -1,0 +1,9 @@
+name: highwayenv-py312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - highway-env==1.12.1
+      - matplotlib==3.11.1
