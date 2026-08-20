@@ -1,0 +1,55 @@
+{
+  "ego": {
+    "controller": "pure_pursuit", // Ego controller: idm, pid, pure_pursuit, mpc, or nmpc.
+    "state": "cruise", // Explicit ego planning state: cruise, follow, or stop.
+    "state_predictor": "ekf" // Obstacle prediction algorithm used by the agent.
+  },
+  "global_planner": {
+    "target_lane": 1, // Zero-based lane for the reference route.
+    "horizon": 250.0, // Forward length of the global reference route in meters.
+    "point_spacing": 5.0 // Distance between sampled global-route points in meters.
+  },
+  "local_planner": {
+    "horizon": 120.0, // Maximum forward planning distance in meters.
+    "obstacle_horizon": 70.0, // Longitudinal range used to cache obstacle states.
+    "safety_gap": 60.0, // Additional planning gap used for obstacle-related decisions.
+    "obstacle_margin": 0.35, // Extra longitudinal and lateral collision margin in meters.
+    "lateral_step_fraction": 0.2, // Lateral sampling step as a fraction of lane width.
+    "trajectory_duration": 2.0, // Legacy/default terminal time for a candidate trajectory.
+    "trajectory_dt": 0.2, // Time interval between trajectory waypoints in seconds.
+    "maneuver_duration": 2.0, // Nominal duration of a lateral maneuver in seconds.
+    "target_speed": 100.0, // Desired local-planner speed in km/h; converted to m/s internally.
+    "duration_samples": [1.5, 2.0, 2.5], // Terminal times sampled for candidate trajectories.
+    "lane_boundary_tolerance": 0.000001, // Numerical tolerance for lane-boundary checks.
+    "footprint_check_substeps": 4, // Extra collision-check samples between adjacent waypoints.
+    "follow_time_headway": 1.5, // Desired time gap to a lead vehicle in follow mode.
+    "follow_min_gap": 8.0, // Minimum stand-off distance in follow mode in meters.
+    "stop_gap": 5.0 // Desired distance to the stop position in meters.
+  },
+  "controllers": {
+    "pid": {
+      "longitudinal_kp": 1.2, // Proportional gain for longitudinal speed control.
+      "longitudinal_ki": 0.05, // Integral gain for longitudinal speed control.
+      "longitudinal_kd": 0.1, // Derivative gain for longitudinal speed control.
+      "lateral_kp": 0.4, // Proportional gain for lateral tracking error.
+      "lateral_ki": 0.0, // Integral gain for lateral tracking error.
+      "lateral_kd": 0.08, // Derivative gain for lateral tracking error.
+      "heading_weight": 2.0, // Weight of heading error in the lateral PID error.
+      "lookahead_time": 0.8, // Future trajectory time used as the PID target in seconds.
+      "acceleration_limit": 5.0, // Absolute acceleration limit in m/s^2.
+      "steering_limit": 0.7853981633974483 // Absolute steering-angle limit in radians.
+    },
+    "pure_pursuit": {
+      "longitudinal_kp": 1.2, // Proportional gain for longitudinal speed control.
+      "longitudinal_ki": 0.05, // Integral gain for longitudinal speed control.
+      "longitudinal_kd": 0.1, // Derivative gain for longitudinal speed control.
+      "lookahead_base": 5.0, // Base Pure Pursuit lookahead distance in meters.
+      "lookahead_speed_gain": 0.5, // Additional lookahead distance per m/s of vehicle speed.
+      "min_lookahead": 5.0, // Minimum Pure Pursuit lookahead distance in meters.
+      "max_lookahead": 20.0, // Maximum Pure Pursuit lookahead distance in meters.
+      "wheelbase": 2.5, // Vehicle wheelbase used by Pure Pursuit geometry in meters.
+      "acceleration_limit": 5.0, // Absolute acceleration limit in m/s^2.
+      "steering_limit": 0.7853981633974483 // Absolute steering-angle limit in radians.
+    }
+  }
+}   

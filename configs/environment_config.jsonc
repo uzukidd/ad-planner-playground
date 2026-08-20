@@ -1,0 +1,7 @@
+{
+  "lanes_count": 3, // Number of parallel lanes in the highway environment.
+  "vehicles_count": 20, // Number of vehicles spawned in the environment.
+  "duration": 120, // Maximum episode duration in seconds.
+  "policy_frequency": 20, // Number of policy steps per second.
+  "simulation_frequency": 60 // Physics simulation steps per second.
+}
