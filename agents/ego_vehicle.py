@@ -95,7 +95,7 @@ class EgoVehicleAgent:
         detection = self.detector.detect(ego_vehicle, obstacles)
         obstacle_states = self.state_predictor.predict(
             detection.obstacles,
-            self.planner.prediction_times(),
+            self.planner.prediction_times(self.state),
         )
         global_plan = (
             self.global_planner.plan(detection.ego_vehicle)

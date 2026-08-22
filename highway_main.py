@@ -73,8 +73,9 @@ def npc_vehicles(env: gym.Env) -> list[IDMVehicle]:
 def handle_target_lane_input(
     env: gym.Env,
     global_planner: FixedLaneGlobalPlanner,
+    agent: EgoVehicleAgent | None,
 ) -> None:
-    """Consume lane-selection arrows and forward all other viewer events."""
+    """Consume lane/state shortcuts and forward all other viewer events."""
     viewer = env.unwrapped.viewer
     if viewer is None:
         return
@@ -83,10 +84,26 @@ def handle_target_lane_input(
         if event.type in {pygame.KEYDOWN, pygame.KEYUP} and event.key in {
             pygame.K_UP,
             pygame.K_DOWN,
+            pygame.K_z,
+            pygame.K_x,
+            pygame.K_c,
         }:
             if event.type == pygame.KEYDOWN:
-                direction = -1 if event.key == pygame.K_UP else 1
-                global_planner.shift_target_lane(direction, env.unwrapped.vehicle)
+                state_keys = {
+                    pygame.K_z: "cruise",
+                    pygame.K_x: "follow",
+                    pygame.K_c: "stop",
+                }
+                if event.key in state_keys:
+                    if agent is not None:
+                        agent.set_state(state_keys[event.key])
+                else:
+                    direction = -1 if event.key == pygame.K_UP else 1
+                    changed = global_planner.shift_target_lane(
+                        direction, env.unwrapped.vehicle
+                    )
+                    if changed and agent is not None:
+                        agent.set_state("cruise")
             continue
         pygame.event.post(event)
     viewer.handle_events()
@@ -303,7 +320,10 @@ def run_highwayenv(
     pipeline = create_pipeline(settings, ego_controller)
     global_planner = pipeline.global_planner
     planner: LocalPlanner = pipeline.local_planner
-    predictor: StatePredictor = create_state_predictor(state_predictor_name)
+    predictor: StatePredictor = create_state_predictor(
+        state_predictor_name,
+        settings,
+    )
     controller = pipeline.controller
     agent = (
         EgoVehicleAgent(
@@ -349,7 +369,7 @@ def run_highwayenv(
             last_policy_start = policy_start
             policy_dt = 1 / env.unwrapped.config["policy_frequency"]
             if human:
-                handle_target_lane_input(env, global_planner)
+                handle_target_lane_input(env, global_planner, agent)
             traffic_behavior.update(npc_vehicles(env), env.unwrapped.np_random, policy_dt)
             if agent:
                 agent_step = agent.step(
@@ -369,6 +389,7 @@ def run_highwayenv(
                 agent.update_obstacles(npc_vehicles(env), policy_dt)
             else:
                 predictor.update(npc_vehicles(env), policy_dt)
+                
             should_render = human or step == steps - 1 or terminated or truncated
             render_plan = None
             if should_render:
@@ -439,7 +460,7 @@ def parse_args() -> argparse.Namespace:
         "--ego-state",
         choices=("cruise", "follow", "stop"),
         default=None,
-        help="Explicit ego planning state; state transitions are disabled.",
+        help="Initial ego planning state; human mode can switch it with z/x/c.",
     )
     parser.add_argument(
         "--output",

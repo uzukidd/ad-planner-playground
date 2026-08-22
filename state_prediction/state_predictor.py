@@ -203,15 +203,34 @@ class StatePredictor(Protocol):
 class EKFTrackPredictionModel:
     """Extended Kalman filter for a constant-turn-rate vehicle model."""
 
+    initial_covariance: tuple[float, ...] = (2.0, 2.0, 4.0, 0.2, 0.5)
+    process_noise: tuple[float, ...] = (0.2, 0.2, 1.0, 0.02, 0.1)
+    measurement_noise: tuple[float, ...] = (0.5, 0.5, 1.0, 0.05)
     state: np.ndarray | None = field(default=None, init=False)
     covariance: np.ndarray | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        """Validate diagonal covariance and noise vectors from configuration."""
+        if len(self.initial_covariance) != 5:
+            raise ValueError("initial_covariance must contain 5 diagonal values.")
+        if len(self.process_noise) != 5:
+            raise ValueError("process_noise must contain 5 diagonal values.")
+        if len(self.measurement_noise) != 4:
+            raise ValueError("measurement_noise must contain 4 diagonal values.")
+        for name, values in (
+            ("initial_covariance", self.initial_covariance),
+            ("process_noise", self.process_noise),
+            ("measurement_noise", self.measurement_noise),
+        ):
+            if not np.all(np.isfinite(values)) or np.any(np.asarray(values) < 0.0):
+                raise ValueError(f"{name} must contain finite nonnegative values.")
 
     def reset(self, track: NPCTrack) -> None:
         self.state = np.array(
             [track.position[0], track.position[1], track.speed, track.heading, 0.0],
             dtype=float,
         )
-        self.covariance = np.diag([2.0, 2.0, 4.0, 0.2, 0.5])
+        self.covariance = np.diag(self.initial_covariance)
 
     @staticmethod
     def transition(state: np.ndarray, dt: float) -> np.ndarray:
@@ -239,7 +258,7 @@ class EKFTrackPredictionModel:
                 [0.0, 0.0, 0.0, 0.0, 1.0],
             ]
         )
-        process_noise = np.diag([0.2, 0.2, 1.0, 0.02, 0.1])
+        process_noise = np.diag(self.process_noise)
         self.state = self.transition(self.state, dt)
         self.covariance = (
             transition_jacobian @ self.covariance @ transition_jacobian.T
@@ -261,7 +280,7 @@ class EKFTrackPredictionModel:
                 [0.0, 0.0, 0.0, 1.0, 0.0],
             ]
         )
-        measurement_noise = np.diag([0.5, 0.5, 1.0, 0.05])
+        measurement_noise = np.diag(self.measurement_noise)
         innovation = measurement - measurement_matrix @ self.state
         innovation[3] = wrap_angle(innovation[3])
         innovation_covariance = (
@@ -356,15 +375,19 @@ class MultiTrackStatePredictor:
 class EKFStatePredictor(MultiTrackStatePredictor):
     """Backward-compatible alias for the default EKF configuration."""
 
-    def __init__(self) -> None:
-        super().__init__(model_factory=EKFTrackPredictionModel)
+    def __init__(self, **model_parameters: Any) -> None:
+        super().__init__(
+            model_factory=lambda: EKFTrackPredictionModel(**model_parameters)
+        )
 
 
 class EKFObstacleStatePredictor(MultiTrackStatePredictor):
     """Produce time-aligned obstacle trajectories from per-NPC EKF models."""
 
-    def __init__(self) -> None:
-        super().__init__(model_factory=EKFTrackPredictionModel)
+    def __init__(self, **model_parameters: Any) -> None:
+        super().__init__(
+            model_factory=lambda: EKFTrackPredictionModel(**model_parameters)
+        )
 
     def predict(
         self, obstacles: Sequence[Any], times: np.ndarray
@@ -401,8 +424,12 @@ class EKFObstacleStatePredictor(MultiTrackStatePredictor):
         return tuple(trajectories)
 
 
-def create_state_predictor(name: str) -> StatePredictor:
+def create_state_predictor(
+    name: str,
+    config: dict[str, Any] | None = None,
+) -> StatePredictor:
     """Create a registered multi-NPC prediction manager."""
     if name == "ekf":
-        return EKFObstacleStatePredictor()
+        predictor_config = (config or {}).get("state_predictors", {}).get("ekf", {})
+        return EKFObstacleStatePredictor(**predictor_config)
     raise ValueError(f"Unknown state predictor: {name}")

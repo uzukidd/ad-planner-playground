@@ -7,7 +7,18 @@ from typing import Any, Protocol, Sequence
 
 import numpy as np
 
-from .global_planner import GlobalPlan
+from ..global_planning.global_planner import GlobalPlan
+from ..planning_utils import (
+    candidate_cost as candidate_cost_fn,
+    evaluate_polynomial,
+    frenet_headings,
+    local_coordinates_array,
+    longitudinal_quintic_coefficients,
+    positions_array,
+    quartic_coefficients,
+    quintic_coefficients,
+    sample_times,
+)
 
 
 @dataclass
@@ -70,7 +81,7 @@ class LocalPlanner(Protocol):
         reference_route: GlobalPlan | None = None,
     ) -> LocalPlan: ...
 
-    def prediction_times(self) -> np.ndarray: ...
+    def prediction_times(self, ego_state: str = "cruise") -> np.ndarray: ...
 
 
 @dataclass
@@ -93,255 +104,88 @@ class FrenetLocalPlanner:
     follow_time_headway: float = 1.5
     follow_min_gap: float = 8.0
     stop_gap: float = 5.0
+    state_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Convert the configured target speed from km/h to internal m/s."""
         if not np.isfinite(self.target_speed) or self.target_speed < 0.0:
             raise ValueError("target_speed must be a finite nonnegative value in km/h.")
+        allowed_states = {"cruise", "follow", "stop"}
+        unknown_states = set(self.state_configs) - allowed_states
+        if unknown_states:
+            names = ", ".join(sorted(unknown_states))
+            raise ValueError(f"Unknown local-planner state configuration(s): {names}")
+        for state, parameters in self.state_configs.items():
+            if not isinstance(parameters, dict):
+                raise ValueError(
+                    f"local_planner.state_configs.{state} must be an object."
+                )
+            supported_parameters = {
+                "trajectory_duration",
+                "trajectory_dt",
+                "maneuver_duration",
+                "target_speed",
+                "duration_samples",
+                "obstacle_margin",
+                "lane_boundary_tolerance",
+                "footprint_check_substeps",
+                "follow_time_headway",
+                "follow_min_gap",
+                "stop_gap",
+            }
+            unknown_parameters = set(parameters) - supported_parameters
+            if unknown_parameters:
+                names = ", ".join(sorted(unknown_parameters))
+                raise ValueError(
+                    f"Unknown state_configs.{state} parameter(s): {names}"
+                )
+            if "duration_samples" in parameters:
+                parameters["duration_samples"] = tuple(parameters["duration_samples"])
+            if "target_speed" in parameters:
+                speed = parameters["target_speed"]
+                if not np.isfinite(speed) or speed < 0.0:
+                    raise ValueError(
+                        f"state_configs.{state}.target_speed must be finite and nonnegative."
+                    )
         self.target_speed_mps = float(self.target_speed) / 3.6
 
-    def prediction_times(self) -> np.ndarray:
+    def _state_parameters(self, ego_state: str) -> dict[str, Any]:
+        """Resolve state-specific planner and sampling values."""
+        if ego_state not in {"cruise", "follow", "stop"}:
+            raise ValueError(f"Unsupported ego state: {ego_state}")
+        parameters: dict[str, Any] = {
+            "trajectory_duration": self.trajectory_duration,
+            "trajectory_dt": self.trajectory_dt,
+            "maneuver_duration": self.maneuver_duration,
+            "target_speed": self.target_speed,
+            "target_speed_mps": self.target_speed_mps,
+            "duration_samples": self.duration_samples,
+            "obstacle_margin": self.obstacle_margin,
+            "lane_boundary_tolerance": self.lane_boundary_tolerance,
+            "footprint_check_substeps": self.footprint_check_substeps,
+            "follow_time_headway": self.follow_time_headway,
+            "follow_min_gap": self.follow_min_gap,
+            "stop_gap": self.stop_gap,
+        }
+        parameters.update(self.state_configs.get(ego_state, {}))
+        parameters["duration_samples"] = tuple(parameters["duration_samples"])
+        parameters["target_speed_mps"] = float(parameters["target_speed"]) / 3.6
+        return parameters
+
+    def prediction_times(self, ego_state: str = "cruise") -> np.ndarray:
         """Timestamps shared by Ego planning and obstacle prediction."""
-        maximum_duration = max(self._candidate_durations())
-        return self._sample_times(maximum_duration)
+        parameters = self._state_parameters(ego_state)
+        maximum_duration = max(self._candidate_durations(parameters))
+        return sample_times(maximum_duration, parameters["trajectory_dt"])
 
-    def _candidate_durations(self) -> tuple[float, ...]:
+    def _candidate_durations(
+        self, parameters: dict[str, Any] | None = None
+    ) -> tuple[float, ...]:
         """Return sorted positive terminal times, including the legacy value."""
-        durations = {float(self.trajectory_duration)}
-        durations.update(float(duration) for duration in self.duration_samples)
+        parameters = parameters or self._state_parameters("cruise")
+        durations = {float(parameters["trajectory_duration"])}
+        durations.update(float(duration) for duration in parameters["duration_samples"])
         return tuple(sorted(duration for duration in durations if duration > 0.0))
-
-    @staticmethod
-    def _quintic_coefficients(
-        start: float,
-        end: float,
-        duration: float,
-        start_velocity: float = 0.0,
-        start_acceleration: float = 0.0,
-        end_velocity: float = 0.0,
-        end_acceleration: float = 0.0,
-    ) -> np.ndarray:
-        """Fit a quintic from the current lateral state to a terminal state."""
-        if duration <= 0.0:
-            raise ValueError("Quintic duration must be positive.")
-        matrix = np.array(
-            [
-                [duration**3, duration**4, duration**5],
-                [3 * duration**2, 4 * duration**3, 5 * duration**4],
-                [6 * duration, 12 * duration**2, 20 * duration**3],
-            ]
-        )
-        tail = np.linalg.solve(
-            matrix,
-            np.array(
-                [
-                    end - start - start_velocity * duration
-                    - 0.5 * start_acceleration * duration**2,
-                    end_velocity - start_velocity - start_acceleration * duration,
-                    end_acceleration - start_acceleration,
-                ]
-            ),
-        )
-        return np.array(
-            [start, start_velocity, 0.5 * start_acceleration, *tail]
-        )
-
-    @staticmethod
-    def _quartic_coefficients(
-        start: float, start_speed: float, target_speed: float, duration: float
-    ) -> np.ndarray:
-        """Fit s(t) with zero longitudinal acceleration at both ends."""
-        matrix = np.array(
-            [
-                [3 * duration**2, 4 * duration**3],
-                [6 * duration, 12 * duration**2],
-            ]
-        )
-        tail = np.linalg.solve(matrix, np.array([target_speed - start_speed, 0.0]))
-        return np.array([start, start_speed, 0.0, *tail])
-
-    @staticmethod
-    def _longitudinal_quintic_coefficients(
-        start: float,
-        start_speed: float,
-        start_acceleration: float,
-        end: float,
-        end_speed: float,
-        end_acceleration: float,
-        duration: float,
-    ) -> np.ndarray:
-        """Fit s(t) to a terminal position, speed, and acceleration."""
-        matrix = np.array(
-            [
-                [duration**3, duration**4, duration**5],
-                [3 * duration**2, 4 * duration**3, 5 * duration**4],
-                [6 * duration, 12 * duration**2, 20 * duration**3],
-            ]
-        )
-        tail = np.linalg.solve(
-            matrix,
-            np.array(
-                [
-                    end - start - start_speed * duration
-                    - 0.5 * start_acceleration * duration**2,
-                    end_speed - start_speed - start_acceleration * duration,
-                    end_acceleration - start_acceleration,
-                ]
-            ),
-        )
-        return np.array(
-            [start, start_speed, 0.5 * start_acceleration, *tail]
-        )
-
-    @staticmethod
-    def _evaluate(coefficients: np.ndarray, times: np.ndarray) -> np.ndarray:
-        return sum(coefficient * times**power for power, coefficient in enumerate(coefficients))
-
-    @staticmethod
-    def _local_coordinates_array(lane: Any, positions: np.ndarray) -> np.ndarray:
-        """Vectorized lane coordinates for HighwayEnv's common lane types."""
-        positions = np.asarray(positions, dtype=float)
-        if all(
-            hasattr(lane, attribute)
-            for attribute in ("start", "direction", "direction_lateral")
-        ):
-            delta = positions - np.asarray(lane.start, dtype=float)
-            return np.column_stack(
-                (
-                    delta @ np.asarray(lane.direction, dtype=float),
-                    delta @ np.asarray(lane.direction_lateral, dtype=float),
-                )
-            )
-        if all(
-            hasattr(lane, attribute)
-            for attribute in ("center", "direction", "radius", "start_phase")
-        ):
-            delta = positions - np.asarray(lane.center, dtype=float)
-            phi = np.arctan2(delta[:, 1], delta[:, 0])
-            phase_delta = (phi - lane.start_phase + np.pi) % (2 * np.pi) - np.pi
-            phi = lane.start_phase + phase_delta
-            radius = np.linalg.norm(delta, axis=1)
-            longitudinal = lane.direction * phase_delta * lane.radius
-            lateral = lane.direction * (lane.radius - radius)
-            return np.column_stack((longitudinal, lateral))
-        return np.asarray([lane.local_coordinates(position) for position in positions])
-
-    @staticmethod
-    def _positions_array(
-        lane: Any, longitudinal: np.ndarray, lateral: np.ndarray
-    ) -> np.ndarray:
-        """Vectorized lane positions for the common HighwayEnv lane types."""
-        longitudinal = np.asarray(longitudinal, dtype=float)
-        lateral = np.asarray(lateral, dtype=float)
-        if all(
-            hasattr(lane, attribute)
-            for attribute in ("start", "direction", "direction_lateral")
-        ):
-            return (
-                np.asarray(lane.start, dtype=float)
-                + longitudinal[:, None] * np.asarray(lane.direction, dtype=float)
-                + lateral[:, None]
-                * np.asarray(lane.direction_lateral, dtype=float)
-            )
-        if all(
-            hasattr(lane, attribute)
-            for attribute in ("center", "direction", "radius", "start_phase")
-        ):
-            phi = lane.direction * longitudinal / lane.radius + lane.start_phase
-            radius = lane.radius - lateral * lane.direction
-            return np.column_stack(
-                (
-                    lane.center[0] + radius * np.cos(phi),
-                    lane.center[1] + radius * np.sin(phi),
-                )
-            )
-        return np.asarray(
-            [
-                lane.position(float(sample_s), float(sample_d))
-                for sample_s, sample_d in zip(longitudinal, lateral)
-            ]
-        )
-
-    def _sample_times(self, duration: float) -> np.ndarray:
-        if duration <= 0.0 or self.trajectory_dt <= 0.0:
-            raise ValueError("Trajectory duration and dt must be positive.")
-        step_count = int(np.floor(duration / self.trajectory_dt + 1e-9))
-        times = np.arange(step_count + 1, dtype=float) * self.trajectory_dt
-        if times[-1] < duration - 1e-9:
-            times = np.append(times, duration)
-        else:
-            times[-1] = duration
-        return times
-
-    @staticmethod
-    def _derivative(
-        coefficients: np.ndarray, times: np.ndarray, order: int
-    ) -> np.ndarray:
-        derivative = coefficients.copy()
-        for _ in range(order):
-            derivative = np.array(
-                [power * value for power, value in enumerate(derivative)][1:]
-            )
-        if len(derivative) == 0:
-            return np.zeros_like(times)
-        return FrenetLocalPlanner._evaluate(derivative, times)
-
-    def _candidate_cost(
-        self,
-        lateral_coefficients: np.ndarray,
-        longitudinal_coefficients: np.ndarray,
-        times: np.ndarray,
-        target_lateral: float,
-        target_speed: float,
-    ) -> float:
-        """Score comfort, duration, centerline offset, and terminal speed."""
-        lateral_jerk = self._derivative(lateral_coefficients, times, 3)
-        longitudinal_jerk = self._derivative(longitudinal_coefficients, times, 3)
-        return float(
-            0.05 * np.sum(lateral_jerk**2) * self.trajectory_dt
-            + 0.005 * np.sum(longitudinal_jerk**2) * self.trajectory_dt
-            + 0.1 * times[-1]
-            + 0.5 * target_lateral**2
-            + 0.02 * (target_speed - self.target_speed_mps) ** 2
-        )
-
-    def _frenet_headings(
-        self,
-        lane: Any,
-        longitudinal: np.ndarray,
-        lateral: np.ndarray,
-        times: np.ndarray,
-        fallback_heading: float,
-    ) -> np.ndarray:
-        """Compute vehicle headings without being fooled by clipped samples."""
-        longitudinal = np.asarray(longitudinal, dtype=float)
-        lateral = np.asarray(lateral, dtype=float)
-        times = np.asarray(times, dtype=float)
-        longitudinal_speed = np.gradient(longitudinal, times)
-        lateral_speed = np.gradient(lateral, times)
-        relative_headings = np.arctan2(lateral_speed, longitudinal_speed)
-        # A clipped longitudinal sample can have s_dot=0 while d_dot is
-        # still nonzero.  That is a planner boundary artifact, not a vehicle
-        # pointing sideways, so continue the last valid forward heading.
-        valid = np.abs(longitudinal_speed) > 1e-6
-        for index in range(len(relative_headings)):
-            if not valid[index]:
-                relative_headings[index] = (
-                    relative_headings[index - 1] if index > 0 else 0.0
-                )
-        lane_headings = np.asarray(
-            [
-                lane.heading_at(
-                    float(np.clip(sample, 0.0, lane.length))
-                )
-                for sample in longitudinal
-            ],
-            dtype=float,
-        )
-        headings = lane_headings + relative_headings
-        if len(headings) and not np.isfinite(headings[0]):
-            headings[0] = fallback_heading
-        return headings
 
     def plan(
         self,
@@ -352,6 +196,17 @@ class FrenetLocalPlanner:
     ) -> LocalPlan:
         if ego_state not in {"cruise", "follow", "stop"}:
             raise ValueError(f"Unsupported ego state: {ego_state}")
+        parameters = self._state_parameters(ego_state)
+        trajectory_dt = float(parameters["trajectory_dt"])
+        trajectory_duration = float(parameters["trajectory_duration"])
+        target_speed_mps = float(parameters["target_speed_mps"])
+        obstacle_margin = float(parameters["obstacle_margin"])
+        lane_boundary_tolerance = float(parameters["lane_boundary_tolerance"])
+        footprint_check_substeps = int(parameters["footprint_check_substeps"])
+        follow_time_headway = float(parameters["follow_time_headway"])
+        follow_min_gap = float(parameters["follow_min_gap"])
+        stop_gap = float(parameters["stop_gap"])
+        
         current_lane = (
             reference_route.lane if reference_route is not None else ego_vehicle.lane
         )
@@ -360,10 +215,11 @@ class FrenetLocalPlanner:
             if reference_route is not None
             else ego_vehicle.lane_index
         )
+        
         longitudinal, lateral = current_lane.local_coordinates(ego_vehicle.position)
         start_s = max(0.0, longitudinal)
         end_s = min(current_lane.length, start_s + self.horizon)
-        target_speed = self.target_speed_mps
+        target_speed = target_speed_mps
         if current_lane.speed_limit is not None:
             target_speed = min(target_speed, current_lane.speed_limit)
 
@@ -391,7 +247,7 @@ class FrenetLocalPlanner:
                 "width_array",
                 np.asarray([state.WIDTH for state in obstacle_states], dtype=float),
             )
-            frenet_coordinates = self._local_coordinates_array(
+            frenet_coordinates = local_coordinates_array(
                 current_lane, obstacle_positions
             )
             cached_obstacle = _FrenetObstacle(
@@ -446,12 +302,12 @@ class FrenetLocalPlanner:
                 longitudinal_clearance = (
                     ego_vehicle.LENGTH / 2
                     + obstacle.lengths[indices] / 2
-                    + self.obstacle_margin
+                    + obstacle_margin
                 )
                 lateral_clearance = (
                     ego_vehicle.WIDTH / 2
                     + obstacle.widths[indices] / 2
-                    + self.obstacle_margin
+                    + obstacle_margin
                 )
                 collision = (
                     np.abs(candidate_longitudinal - obstacle_s)
@@ -511,7 +367,7 @@ class FrenetLocalPlanner:
             must be inside at least one of the legal lanes.  Adjacent lanes
             form a continuous union, so corners may belong to different lanes.
             """
-            headings = self._frenet_headings(
+            headings = frenet_headings(
                 current_lane,
                 candidate_longitudinal,
                 candidate_lateral,
@@ -521,7 +377,7 @@ class FrenetLocalPlanner:
 
             half_length = float(ego_vehicle.LENGTH) / 2.0
             half_width = float(ego_vehicle.WIDTH) / 2.0
-            tolerance = self.lane_boundary_tolerance
+            tolerance = lane_boundary_tolerance
             forward = half_length * np.column_stack(
                 (np.cos(headings), np.sin(headings))
             )
@@ -540,7 +396,7 @@ class FrenetLocalPlanner:
             flattened_corners = corners.reshape(-1, 2)
 
             if fast_lane_geometry:
-                coordinates = self._local_coordinates_array(
+                coordinates = local_coordinates_array(
                     current_lane, flattened_corners
                 ).reshape(len(candidate_points), 4, 2)
                 longitudinal_ok = (
@@ -571,9 +427,9 @@ class FrenetLocalPlanner:
         # Generate every (T, d_T) pair even when the centerline is currently clear.
         candidate_trajectories: list[CandidateTrajectory] = []
         feasible_candidates: list[tuple[float, CandidateTrajectory]] = []
-        for duration in self._candidate_durations():
-            candidate_times = self._sample_times(duration)
-            longitudinal_coefficients = self._quartic_coefficients(
+        for duration in self._candidate_durations(parameters):
+            candidate_times = sample_times(duration, trajectory_dt)
+            longitudinal_coefficients = quartic_coefficients(
                 start_s, ego_vehicle.speed, target_speed, duration
             )
             candidate_target_speed = target_speed
@@ -583,10 +439,10 @@ class FrenetLocalPlanner:
                     lead_s_at_end = float(lead_obstacle.longitudinal[lead_indices[-1]])
                     lead_length_at_end = float(lead_obstacle.lengths[lead_indices[-1]])
                     desired_gap = max(
-                        self.stop_gap,
+                        stop_gap,
                         ego_vehicle.LENGTH / 2
                         + lead_length_at_end / 2
-                        + self.obstacle_margin,
+                        + obstacle_margin,
                     )
                     target_longitudinal = np.clip(
                         lead_s_at_end - desired_gap,
@@ -594,7 +450,7 @@ class FrenetLocalPlanner:
                         end_s,
                     )
                 else:
-                    braking_acceleration = max(1.0, 0.5 * self.obstacle_margin + 3.0)
+                    braking_acceleration = max(1.0, 0.5 * obstacle_margin + 3.0)
                     stopping_distance = ego_vehicle.speed**2 / (2.0 * braking_acceleration)
                     target_longitudinal = np.clip(
                         start_s + stopping_distance,
@@ -602,7 +458,7 @@ class FrenetLocalPlanner:
                         end_s,
                     )
                 candidate_target_speed = 0.0
-                longitudinal_coefficients = self._longitudinal_quintic_coefficients(
+                longitudinal_coefficients = longitudinal_quintic_coefficients(
                     start_s,
                     ego_vehicle.speed,
                     0.0,
@@ -616,10 +472,10 @@ class FrenetLocalPlanner:
                 lead_s_at_end = float(lead_obstacle.longitudinal[lead_indices[-1]])
                 lead_length_at_end = float(lead_obstacle.lengths[lead_indices[-1]])
                 desired_gap = max(
-                    self.follow_min_gap + self.follow_time_headway * ego_vehicle.speed,
+                    follow_min_gap + follow_time_headway * ego_vehicle.speed,
                     ego_vehicle.LENGTH / 2
                     + lead_length_at_end / 2
-                    + self.obstacle_margin,
+                    + obstacle_margin,
                 )
                 lead_speed_at_end = float(lead_obstacle.speeds[lead_indices[-1]])
                 candidate_target_speed = min(target_speed, lead_speed_at_end)
@@ -628,7 +484,7 @@ class FrenetLocalPlanner:
                     start_s,
                     end_s,
                 )
-                longitudinal_coefficients = self._longitudinal_quintic_coefficients(
+                longitudinal_coefficients = longitudinal_quintic_coefficients(
                     start_s,
                     ego_vehicle.speed,
                     0.0,
@@ -638,41 +494,41 @@ class FrenetLocalPlanner:
                     duration,
                 )
             candidate_longitudinal = np.clip(
-                self._evaluate(longitudinal_coefficients, candidate_times),
+                evaluate_polynomial(longitudinal_coefficients, candidate_times),
                 start_s,
                 end_s,
             )
             for target_lateral in lateral_targets:
-                lateral_coefficients = self._quintic_coefficients(
+                lateral_coefficients = quintic_coefficients(
                     lateral, float(target_lateral), duration
                 )
-                candidate_lateral = self._evaluate(
+                candidate_lateral = evaluate_polynomial(
                     lateral_coefficients, candidate_times
                 )
-                candidate_points = self._positions_array(
+                candidate_points = positions_array(
                     current_lane, candidate_longitudinal, candidate_lateral
                 )
                 check_times = candidate_times
                 check_points = candidate_points
                 check_longitudinal = candidate_longitudinal
                 check_lateral = candidate_lateral
-                if self.footprint_check_substeps > 1 and len(candidate_times) > 1:
+                if footprint_check_substeps > 1 and len(candidate_times) > 1:
                     dense_times = np.linspace(
                         candidate_times[:-1, None],
                         candidate_times[1:, None],
-                        self.footprint_check_substeps + 1,
+                        footprint_check_substeps + 1,
                         axis=1,
                     ).reshape(-1)
                     check_times = np.unique(
                         np.concatenate((candidate_times[:1], dense_times))
                     )
                     check_longitudinal = np.clip(
-                        self._evaluate(longitudinal_coefficients, check_times),
+                        evaluate_polynomial(longitudinal_coefficients, check_times),
                         start_s,
                         end_s,
                     )
-                    check_lateral = self._evaluate(lateral_coefficients, check_times)
-                    check_points = self._positions_array(
+                    check_lateral = evaluate_polynomial(lateral_coefficients, check_times)
+                    check_points = positions_array(
                         current_lane, check_longitudinal, check_lateral
                     )
                 candidate_lane_feasible = lane_feasible(
@@ -687,12 +543,14 @@ class FrenetLocalPlanner:
                     candidate_times,
                     nearby_obstacles,
                 )
-                candidate_cost = self._candidate_cost(
+                candidate_cost = candidate_cost_fn(
                     lateral_coefficients,
                     longitudinal_coefficients,
                     candidate_times,
                     float(target_lateral),
                     candidate_target_speed,
+                    trajectory_dt,
+                    target_speed_mps,
                 )
                 candidate = CandidateTrajectory(
                     points=candidate_points,
@@ -718,7 +576,7 @@ class FrenetLocalPlanner:
                 candidate_trajectories,
                 key=lambda candidate: (
                     abs(candidate.target_shift),
-                    abs(candidate.duration - self.trajectory_duration),
+                    abs(candidate.duration - trajectory_duration),
                 ),
             )
 
@@ -726,12 +584,12 @@ class FrenetLocalPlanner:
         longitudinal_samples = np.asarray(selected.longitudinal)
         lateral_samples = np.asarray(selected.lateral)
         target_shift = selected.target_shift
-        points = self._positions_array(
+        points = positions_array(
             current_lane, longitudinal_samples, lateral_samples
         )
         velocities = np.gradient(points, times, axis=0)
         speeds = np.linalg.norm(velocities, axis=1)
-        headings = self._frenet_headings(
+        headings = frenet_headings(
             current_lane,
             longitudinal_samples,
             lateral_samples,

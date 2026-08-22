@@ -4,6 +4,13 @@
     "state": "cruise", // Explicit ego planning state: cruise, follow, or stop.
     "state_predictor": "ekf" // Obstacle prediction algorithm used by the agent.
   },
+  "state_predictors": {
+    "ekf": {
+      "initial_covariance": [2.0, 2.0, 4.0, 0.2, 0.5], // Initial diagonal covariance for [x, y, speed, heading, yaw_rate].
+      "process_noise": [0.2, 0.2, 1.0, 0.02, 0.1], // Diagonal process noise added during EKF prediction.
+      "measurement_noise": [0.5, 0.5, 1.0, 0.05] // Diagonal observation noise for [x, y, speed, heading].
+    }
+  },
   "global_planner": {
     "target_lane": 1, // Zero-based lane for the reference route.
     "horizon": 250.0, // Forward length of the global reference route in meters.
@@ -24,7 +31,30 @@
     "footprint_check_substeps": 4, // Extra collision-check samples between adjacent waypoints.
     "follow_time_headway": 1.5, // Desired time gap to a lead vehicle in follow mode.
     "follow_min_gap": 8.0, // Minimum stand-off distance in follow mode in meters.
-    "stop_gap": 5.0 // Desired distance to the stop position in meters.
+    "stop_gap": 5.0, // Desired distance to the stop position in meters.
+    "state_configs": {
+      "cruise": {
+        "target_speed": 100.0, // Cruise target speed in km/h.
+        "trajectory_duration": 2.0, // Cruise terminal time in seconds.
+        "trajectory_dt": 0.2, // Cruise waypoint interval in seconds.
+        "duration_samples": [1.5, 2.0, 2.5] // Cruise terminal times to sample.
+      },
+      "follow": {
+        "target_speed": 90.0, // Follow target speed cap in km/h.
+        "trajectory_duration": 2.5, // Follow terminal time in seconds.
+        "trajectory_dt": 0.2, // Follow waypoint interval in seconds.
+        "duration_samples": [2.0, 2.5, 3.0], // Follow terminal times to sample.
+        "follow_time_headway": 1.5, // Follow time headway in seconds.
+        "follow_min_gap": 8.0 // Follow minimum gap in meters.
+      },
+      "stop": {
+        "target_speed": 0.0, // Stop target speed in km/h.
+        "trajectory_duration": 2.5, // Stop terminal time in seconds.
+        "trajectory_dt": 0.2, // Stop waypoint interval in seconds.
+        "duration_samples": [2.0, 2.5, 3.0], // Stop terminal times to sample.
+        "stop_gap": 5.0 // Stop gap in meters.
+      }
+    }
   },
   "controllers": {
     "pid": {
